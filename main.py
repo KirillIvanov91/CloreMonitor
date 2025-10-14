@@ -23,22 +23,72 @@ GPU_EFFICIENCY = {
 }
 
 # --- WhatToMine API
+# --- Кэширование данных WhatToMine
+WHAT_TO_MINE_CACHE = {}
+WHAT_TO_MINE_CACHE_TTL = 300  # 5 минут в секундах
+
 def get_whattomine_data():
+    # Проверяем, не устарел ли кэш
+    current_time = time.time()
+    if WHAT_TO_MINE_CACHE and current_time - WHAT_TO_MINE_CACHE.get("timestamp", 0) < WHAT_TO_MINE_CACHE_TTL:
+        return WHAT_TO_MINE_CACHE["data"]
+
     try:
         r = requests.get("https://whattomine.com/coins.json", timeout=5)
-        
+        if "error" in r.json():
+            logging.error(f"Ошибка WhatToMine API: {r.json()['error']}")
+            return {}
+
         if r.status_code == 200:
-            return r.json().get("coins", {})
+            coins_data = r.json().get("coins", {})
+            # Обновляем кэш
+            WHAT_TO_MINE_CACHE.update({
+                "data": coins_data,
+                "timestamp": current_time
+            })
+            logging.info(f"Получены данные от WhatToMine: {list(coins_data.values())[:3]}...")
+            return coins_data
     except Exception as e:
         logging.warning(f"WhatToMine error: {e}")
     return {}
+
+
+
 def get_best_coin_for_gpu(gpu_model):
-    coins = get_whattomine_data()
+    coins = get_whattomine_data()  # Использует кэшированные данные
+
     if not coins:
         return {"coin": "Unknown", "profit": 0.0}
 
-    best = max(coins.values(), key=lambda x: x.get("profit", 0))
-    return {"coin": best["tag"], "profit": best["profit"]}
+    valid_coins = []
+    for coin in coins.values():
+        if isinstance(coin, dict) and "profitability" in coin and "tag" in coin:
+            valid_coins.append({
+                "tag": coin["tag"],
+                "profit": float(coin["profitability"])
+            })
+
+    if not valid_coins:
+        logging.warning("Нет валидных монет в ответе WhatToMine")
+        return {"coin": "Unknown", "profit": 0.0}
+
+    try:
+        best = max(valid_coins, key=lambda x: x.get("profit", 0))
+        return {
+            "coin": best.get("tag", "Unknown"),
+            "profit": float(best.get("profit", 0.0))
+        }
+    except Exception as e:
+        logging.error(f"Ошибка при поиске лучшей монеты: {e}")
+        return {"coin": "Unknown", "profit": 0.0}
+
+
+
+
+
+
+
+
 
 def get_gpu_efficiency(gpu_model, user_id):
     if user_id in user_efficiency:
@@ -55,18 +105,32 @@ def get_clore_servers():
         r = requests.get(CLORE_API_URL, headers=API_HEADERS, timeout=5)
         if r.status_code == 200:
             logging.info(f"Запрос на получения северов с Clore получил {r.status_code}")
-            return r.json().get("result", [])
+            return r.json().get("servers", [])
     except Exception as e:
         logging.warning(f"Clore error: {e}")
     return []
 
 # --- Расчет доходности
 def calculate_profit(user_id, srv):
-    gpu_model = srv.get("gpu", "")
-    gpu_count = srv.get("gpu_count", 1)
-    price = float(srv.get("price", 0))
+    # Извлекаем модель GPU из specs.gpu
+    gpu_model = srv.get("specs", {}).get("gpu", "").replace("1x ", "")
+    
+    # Получаем количество GPU из массива
+    gpu_count = len(srv.get("gpu_array", []))
+    
+    # Безопасный доступ к цене через вложенную структуру
+    price_data = srv.get("price", {})
+    original_price = price_data.get("original_usd", {})
+    price = float(original_price.get("on_demand", 0))  # Берем on-demand цену
+    
+    ########best_coin = get_best_coin_for_gpu(gpu_model)
 
-    best_coin = get_best_coin_for_gpu(gpu_model)
+    try:
+            best_coin = get_best_coin_for_gpu(gpu_model)
+    except Exception as e:
+            logging.error(f"Ошибка расчета прибыли: {e}")
+            return 0.0, 0.0, "Error"
+
     eff = get_gpu_efficiency(gpu_model, user_id)
     income = best_coin["profit"] * gpu_count * eff
     profit = income - price
@@ -82,8 +146,12 @@ def check_servers_for_user(user_id, app):
     already_sent = sent_servers.get(user_id, set())
 
     for srv in servers:
-        gpu_count = srv.get("gpu_count", 1)
-        price = float(srv.get("price", 0))
+        # Безопасный доступ к цене
+        price_data = srv.get("price", {})
+        original_price = price_data.get("original_usd", {})
+        price = float(original_price.get("on_demand", 0))
+        
+        gpu_count = len(srv.get("gpu_array", []))
 
         if gpu_count < filters["min_gpu"] or price > filters["max_price"]:
             continue
@@ -98,7 +166,7 @@ def check_servers_for_user(user_id, app):
 
         if profit > 0:
             msg = (
-                f"💻 GPU: {srv.get('gpu')} x{gpu_count}\n"
+                f"💻 GPU: {srv.get('specs', {}).get('gpu')} x{gpu_count}\n"
                 f"💰 Цена: ${price:.2f}\n"
                 f"📈 Монета: {coin}\n"
                 f"📊 Доход: ${income:.2f}\n"
@@ -131,20 +199,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start_check — начать авто-проверку\n"
         "/stop_check — остановить\n"
     )
-    await update.message.reply_text(text)
+    if update.message:
+        await update.message.reply_text(text)
 
 async def filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("Мин. 10 GPU", callback_data="filter_min_gpu_10")],
         [InlineKeyboardButton("Цена < $5", callback_data="filter_max_price_5")]
     ]
-    await update.message.reply_text("⚙️ Установите фильтры:", reply_markup=InlineKeyboardMarkup(keyboard))
+    if update.message:
+        await update.message.reply_text("⚙️ Установите фильтры:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.message.chat_id
     f = user_filters.get(user_id, {"min_gpu": 1, "max_price": 9999})
+    
     if query.data == "filter_min_gpu_10":
         f["min_gpu"] = 10
     if query.data == "filter_max_price_5":
@@ -152,35 +223,49 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_filters[user_id] = f
     await query.edit_message_text(f"✅ Фильтры обновлены: {f}")
 
+
+
 async def start_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_chat.id
-    if active_users.get(user_id):
-        await update.message.reply_text("⏳ Уже проверяю...")
-        return
+    if update.effective_chat:
+        user_id = update.effective_chat.id
+        if active_users.get(user_id):
+            if update.message:
+                await update.message.reply_text("⏳ Уже проверяю...")
+                return
     active_users[user_id] = True
     # Передаем основной объект `app`, а не `context.application`
     threading.Thread(target=auto_check, args=(user_id, context.application), daemon=True).start()
-    await update.message.reply_text("✅ Автоматическая проверка запущена!")
+    if update.message:
+        await update.message.reply_text("✅ Автоматическая проверка запущена!")
+
+
+
 
 async def stop_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_chat.id
-    active_users[user_id] = False
-    await update.message.reply_text("⏸ Проверка остановлена.")
+    if update.effective_chat:
+        user_id = update.effective_chat.id
+        active_users[user_id] = False
+        if update.message:
+            await update.message.reply_text("⏸ Проверка остановлена.")
     
+# --- Команда /check_servers
 async def check_servers_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_chat.id
-    filters = user_filters.get(user_id, {"min_gpu": 1, "max_price": 9999})
-    already_sent = set()  # Используем временное множество для одноразовой проверки
+    if update.effective_chat:
+        user_id = update.effective_chat.id
+        filters = user_filters.get(user_id, {"min_gpu": 1, "max_price": 9999})
 
     servers = get_clore_servers()
     if not servers:
-        await update.message.reply_text("❌ Нет доступных серверов.")
-        return
+        if update.message:
+            await update.message.reply_text("❌ Нет доступных серверов.")
+            return
 
     result = []
     for srv in servers:
-        gpu_count = srv.get("gpu_count", 1)
-        price = float(srv.get("price", 0))
+        price_data = srv.get("price", {})
+        original_price = price_data.get("original_usd", {})
+        price = float(original_price.get("on_demand", 0))
+        gpu_count = len(srv.get("gpu_array", []))
 
         if gpu_count < filters["min_gpu"] or price > filters["max_price"]:
             continue
@@ -190,7 +275,7 @@ async def check_servers_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
 
         result.append(
-            f"💻 GPU: {srv.get('gpu')} x{gpu_count}\n"
+            f"💻 GPU: {srv.get('specs', {}).get('gpu')} x{gpu_count}\n"
             f"💰 Цена: ${price:.2f}\n"
             f"📈 Монета: {coin}\n"
             f"📊 Доход: ${income:.2f}\n"
@@ -199,10 +284,18 @@ async def check_servers_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     if result:
-        await update.message.reply_text("🔍 Результаты проверки:\n\n" + "\n".join(result))
+        # Разбиваем результаты на части по 20 серверов
+        for i in range(0, len(result), 20):
+            chunk = result[i:i+20]
+            message = "🔍 Результаты проверки:\n\n" + "\n".join(chunk)
+            try:
+                await update.message.reply_text(message)
+            except Exception as e:
+                logging.error(f"Ошибка при отправке сообщения: {e}")
+                await update.message.reply_text("❌ Не удалось отправить результаты.")
     else:
-        await update.message.reply_text("❌ Нет подходящих серверов по вашим фильтрам.")
-
+        if update.message:
+            await update.message.reply_text("❌ Нет подходящих серверов по вашим фильтрам.")
 def main():
     # Создаем приложение через ApplicationBuilder
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
