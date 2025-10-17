@@ -6,6 +6,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 from config import TELEGRAM_TOKEN, CLORE_API_URL, CHECK_INTERVAL, API_TOKEN, API_HEADERS
 import logging
 import asyncio
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # --- Логирование
 logging.basicConfig(level=logging.INFO)
@@ -27,14 +28,24 @@ GPU_EFFICIENCY = {
 
 # --- Clore API
 def get_clore_servers():
-    try:
-        r = requests.get(CLORE_API_URL, headers=API_HEADERS, timeout=5)
-        if r.status_code == 200:
-            logging.info(f"Запрос на получения северов с Clore получил {r.status_code}")
+    
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    def _request():
+        try:
+            r = requests.get(
+                CLORE_API_URL,
+                headers=API_HEADERS,
+                timeout=10  # Увеличенный таймаут
+            )
+            r.raise_for_status()
+            logging.info(f"Успешный запрос к Clore: {r.status_code}")
             return r.json().get("servers", [])
-    except Exception as e:
-        logging.warning(f"Clore error: {e}")
-    return []
+        except Exception as e:
+            logging.warning(f"Clore error: {e}")
+            return []
+
+    return _request()
 
 
 
@@ -125,6 +136,12 @@ async def check_servers_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         if update.message:
             await update.message.reply_text("❌ Нет подходящих серверов по вашим фильтрам.")
+
+
+
+
+
+            
 def main():
     # Создаем приложение через ApplicationBuilder
     app = (
@@ -134,13 +151,24 @@ def main():
         .read_timeout(60)     # Увеличенный таймаут чтения
         .build()
     )
+
+
+
+
+
     # Регистрируем обработчики команд
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("filters", filters))
     app.add_handler(CommandHandler("check_servers", check_servers_now))
     app.add_handler(CallbackQueryHandler(button))
     # Запускаем опрос Telegram API
+
+
+
+
+    
     app.run_polling()
+    
 
 if __name__ == "__main__":
     main()
